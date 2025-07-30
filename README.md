@@ -1,10 +1,4 @@
-# handshaker
-
-**Wi-Fi 802.11 Handshake Sniffer and Deauth Tool**
-
----
-
-## NAME
+# handshaker(1) — Wi-Fi 802.11 Handshake Sniffer and Deauth Tool
 
 **handshaker** — Capture WPA handshakes, manage client lists, and optionally deauthenticate Wi-Fi clients
 
@@ -12,9 +6,9 @@
 
 ## SYNOPSIS
 
-```shell
+```
 handshaker --interface <iface> [options]
-````
+```
 
 ---
 
