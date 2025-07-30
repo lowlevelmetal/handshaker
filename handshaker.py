@@ -39,7 +39,7 @@ def parse_args():
     parser.add_argument('-t', '--timeout', type=int, default=60, help='Client timeout (seconds)')
     parser.add_argument('-d', '--deauth', action='store_true', help='Enable deauthentication')
     parser.add_argument('--interval', type=int, default=10, help='Deauth burst interval (seconds)')
-    parser.add_argument('--output-directory', default='.', help='Directory for .cap files')
+    parser.add_argument('--output-directory', help='Directory for .cap files (no output if not set)')
     return parser.parse_args()
 
 # ----------- Utilities --------------
@@ -69,6 +69,8 @@ def channel_hopper(interface, user_channel=None):
             break
 
 def get_capfile(ssid, output_dir):
+    if not output_dir:
+        return None
     safe_ssid = ssid if ssid else 'unknown'
     fn = os.path.join(output_dir, f'{safe_ssid}_capture.cap')
     if fn not in cap_files:
@@ -127,7 +129,7 @@ def process_packet(pkt, args):
         if not bssid or not client or not is_unicast(client):
             return
 
-        # NEW: Only track clients if AP is already known, when filtering
+        # Only track clients if AP is already known, when filtering
         if (args.target_ssid or args.target_bssid) and bssid not in networks:
             return
 
@@ -148,16 +150,19 @@ def process_packet(pkt, args):
             bssid = pkt[Dot11].addr1
         ssid = networks.get(bssid, {}).get('ssid', 'unknown')
         log(f'Handshake/EAPOL captured for SSID {ssid} ({bssid})')
-        capfile = get_capfile(ssid, args.output_directory)
-        capfile.write(pkt)
+        if args.output_directory:
+            capfile = get_capfile(ssid, args.output_directory)
+            if capfile:
+                capfile.write(pkt)
 
     # Save all packets for filtered networks
     if pkt.haslayer(Dot11):
         bssid = pkt[Dot11].addr2 if pkt[Dot11].addr2 in networks else pkt[Dot11].addr1
         ssid = networks.get(bssid, {}).get('ssid', None)
-        if ssid and args.output_directory:
+        if args.output_directory and ssid:
             capfile = get_capfile(ssid, args.output_directory)
-            capfile.write(pkt)
+            if capfile:
+                capfile.write(pkt)
 
 # ----------- Deauth Thread ----------
 def deauth_worker(args):
@@ -219,9 +224,22 @@ class HandshakerUI:
             items.extend(client_texts)
         self.ap_list_walker[:] = items
 
-        # Bottom: Logs
+        # Bottom: Logs with auto-scroll if at the bottom
         with log_lock:
-            self.log_walker[:] = [urwid.Text(l) for l in logs[-50:]]
+            new_logs = [urwid.Text(l) for l in logs[-50:]]
+
+        log_box = self.log_listbox
+        log_focus_at_end = False
+        if len(self.log_walker):
+            # Use ListBox's focus_position property, not the walker
+            if log_box.focus_position == len(self.log_walker) - 1:
+                log_focus_at_end = True
+
+        self.log_walker[:] = new_logs
+
+        if len(self.log_walker) > 0 and log_focus_at_end:
+            log_box.focus_position = len(self.log_walker) - 1
+
         self.loop.set_alarm_in(1, self.update)
 
     def run(self):
@@ -231,7 +249,10 @@ class HandshakerUI:
 # ------------- Main -----------------
 def main():
     args = parse_args()
-    os.makedirs(args.output_directory, exist_ok=True)
+
+    # Only create the directory if output_directory is set
+    if args.output_directory:
+        os.makedirs(args.output_directory, exist_ok=True)
 
     log(f'Handshaker started on {args.interface}')
     if args.channel:
