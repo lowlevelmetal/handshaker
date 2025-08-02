@@ -12,17 +12,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from scapy.all import *
 
+ui = None 
 stop_sniffer = False
 stop_channel_cycle = False
-log_lock = threading.Lock()
 channel_cycle_lock = threading.Lock()
-logs = deque(maxlen=500) 
 networks = {} 
 
-def log(msg):
-    with log_lock:
-        ts = datetime.now().strftime('%H:%M:%S')
-        logs.append(f'[{ts}] {msg}')
 def is_unicast(mac):
     """Check if MAC address is unicast (not broadcast/multicast)."""
     if not mac:
@@ -31,6 +26,8 @@ def is_unicast(mac):
     return (first_octet & 1) == 0
 
 def packet_handler(pkt):
+    global ui
+
     # Identify APs (Beacon or Probe Response)
     if pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp):
         bssid = pkt[Dot11].addr2
@@ -40,7 +37,7 @@ def packet_handler(pkt):
             ssid = pkt[Dot11Elt].info.decode(errors="ignore")
         if bssid not in networks:
             networks[bssid] = {'ssid': ssid, 'clients': set()}
-            log(f"[+] New AP: {ssid} ({bssid})")
+            ui.log(f"[+] New AP: {ssid} ({bssid})")
 
     # Identify data packets (potential clients)
     if pkt.haslayer(Dot11):
@@ -63,18 +60,19 @@ def packet_handler(pkt):
             # addr1/addr2 may be a client MAC
             if is_unicast(addr1) and addr1 != bssid and addr1 not in networks[bssid]['clients']:
                 networks[bssid]['clients'].add(addr1)
-                log(f"[+] Client {addr1} associated with {bssid} ({networks[bssid]['ssid']})")
+                ui.log(f"[+] Client {addr1} associated with {bssid} ({networks[bssid]['ssid']})")
             if is_unicast(addr2) and addr2 != bssid and addr2 not in networks[bssid]['clients']:
                 networks[bssid]['clients'].add(addr2)
-                log(f"[+] Client {addr2} associated with {bssid} ({networks[bssid]['ssid']})")
+                ui.log(f"[+] Client {addr2} associated with {bssid} ({networks[bssid]['ssid']})")
 
 def sniffer_thread(args):
     sniff(iface=args.interface, prn=packet_handler, store=0,
           stop_filter=lambda pkt: stop_sniffer)
 
 def set_channel(chan, interface):
+    global ui
     subprocess.run(['iw', 'dev', interface, 'set', 'channel', str(chan)])
-    log(f"Channel set to {chan}")
+    ui.log(f"Channel set to {chan}")
 
 def channel_thread(interface):
     i = 1
@@ -106,11 +104,25 @@ def parse_args():
     parser.add_argument('--interval', type=int, default=10, help='Deauth burst interval (seconds)')
     return parser.parse_args()
 
+def clamp(value, min_value, max_value):
+    return max(min_value, min(value, max_value))
+
 class NcursesUI:
     def __init__(self, args):
         self.args = args
         self.running = True
         self.log_offset = 0
+        self.logs = deque(maxlen=250)
+        self.log_lock = threading.Lock()
+
+    def log(self, msg):
+        ts = datetime.now().strftime('%H:%M:%S')
+        fmsg = f"[{ts}] {msg}"
+        with self.log_lock:
+            self.logs.append(fmsg)
+        
+        if self.log_offset != 0:
+            self.log_offset += 1
 
     def draw(self, stdscr):
         stdscr.clear()
@@ -130,20 +142,38 @@ class NcursesUI:
         title = "handshaker - Up/Dn=select AP  Enter=deauth  PgUp/PgDn=scroll log  q=quit"
         stdscr.addnstr(0, 0, title[:maxx].ljust(maxx), maxx, curses.A_REVERSE)
 
-        # Print logs headers 
+        # Print log header
+        total_logs = len(self.logs)
+        total_log_str = f"Log Offset: {self.log_offset} | Total Log: {total_logs}"
+        total_log_strlen = len(total_log_str)
+        log_title_str = "Event Logs".ljust(maxx-total_log_strlen)+total_log_str
         log_pos = panel_h
         stdscr.hline(log_pos, 0, "-", maxx)
         log_pos += 1
-        stdscr.addnstr(log_pos, 0, "Event Log".ljust(maxx), maxx, curses.A_BOLD)
+        stdscr.addnstr(log_pos, 0, log_title_str, maxx, curses.A_BOLD)
         log_pos += 1
-        
+
         # Print logs
-        with log_lock:
-            if len(logs) > 0:
+        with self.log_lock:
+            # Print logs only if necessary
+            if total_logs > 0:
+                # Max log size can only be remaining screen real estate
                 max_log_size = maxy - log_pos - 1
-                for idx, logitem in enumerate(list(logs)[-max_log_size:]):
+
+                # Maximum scroll will always be zero if total_logs
+                # can't fill/overflow screen.
+                max_offset = max(0, total_logs - max_log_size)
+                
+                self.log_offset = min(max_offset, max(0, self.log_offset))
+                end = total_logs - self.log_offset
+                start = max(0, end - max_log_size)
+                for idx, logitem in enumerate(list(self.logs)[start:end]):
                     logitem = logitem.replace('\x00', '')
-                    stdscr.addnstr(log_pos + idx, 0, logitem.ljust(maxx), maxx)
+                    try:
+                        stdscr.addnstr(log_pos + idx, 0, logitem.ljust(maxx), maxx)
+                    except Exception:
+                        # Fallback in case of encoding issues
+                        stdscr.addnstr(log_pos + idx, 0, logitem.encode('utf-8', errors='replace').decode('utf-8').ljust(maxx), maxx)
 
     
     def run(self, stdscr):
@@ -154,14 +184,19 @@ class NcursesUI:
             ch = stdscr.getch()
             if ch == -1:
                 continue
-            if ch in (ord('q'), ord('Q')):
+            elif ch in (ord('q'), ord('Q')):
                 self.running = False
                 break
+            elif ch in (curses.KEY_UP, ord('k')):
+                self.log_offset = max(0, min(self.log_offset + 1, 500))
+            elif ch in (curses.KEY_DOWN, ord('j')):
+                self.log_offset = max(0, min(self.log_offset - 1, 500))
 
 
 def main():
     global stop_sniffer
     global stop_channel_cycle
+    global ui
 
     args = parse_args()
 
@@ -170,7 +205,8 @@ def main():
         print('Root required')
         sys.exit(1)
 
-    log(f'Initializing handshaker on interface {args.interface}')
+    ui = NcursesUI(args)
+    ui.log(f'Initializing handshaker on interface {args.interface}')
    
     # Start packet sniffer
     tsniffer = threading.Thread(target=sniffer_thread, args=(args,))
@@ -179,15 +215,12 @@ def main():
     tchancycle = threading.Thread(target=channel_thread, args=(args.interface,))
     tchancycle.start()
 
-    # Create UI
-    ui = NcursesUI(args)
-
     try:
         curses.wrapper(ui.run)
     except KeyboardInterrupt:
         pass
     finally:
-        log('Exiting...')
+        ui.log('Exiting...')
 
     stop_channel_cycle = True
     stop_sniffer = True
