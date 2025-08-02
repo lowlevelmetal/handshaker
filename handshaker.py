@@ -27,15 +27,16 @@ def is_unicast(mac):
 
 def packet_handler(pkt):
     global ui
+    global networks
 
     # Identify APs (Beacon or Probe Response)
     if pkt.haslayer(Dot11Beacon) or pkt.haslayer(Dot11ProbeResp):
         bssid = pkt[Dot11].addr2
-        ssid = '<Hidden SSID>' 
+        ssid = None 
         ssid_raw = pkt[Dot11Elt].info
         if ssid_raw:
             ssid = pkt[Dot11Elt].info.decode(errors="ignore")
-        if bssid not in networks:
+        if bssid not in networks and ssid is not None:
             networks[bssid] = {'ssid': ssid, 'clients': set()}
             ui.log(f"[+] New AP: {ssid} ({bssid})")
 
@@ -112,6 +113,7 @@ class NcursesUI:
         self.args = args
         self.running = True
         self.log_offset = 0
+        self.ap_offset = 0
         self.logs = deque(maxlen=250)
         self.log_lock = threading.Lock()
 
@@ -125,6 +127,8 @@ class NcursesUI:
             self.log_offset += 1
 
     def draw(self, stdscr):
+        global networks
+
         stdscr.clear()
         maxy, maxx = stdscr.getmaxyx()
         panel_h = maxy//2 - 1
@@ -139,8 +143,23 @@ class NcursesUI:
             return
 
         # Print title
-        title = "handshaker - Up/Dn=select AP  Enter=deauth  PgUp/PgDn=scroll log  q=quit"
+        title = "handshaker - Up/Dn=select AP  Enter=deauth  PgUp/PgDn=scroll log  space=go to log top  q=quit"
         stdscr.addnstr(0, 0, title[:maxx].ljust(maxx), maxx, curses.A_REVERSE)
+        stdscr.addnstr(1, 0, f"Access Points".ljust(maxx), maxx, curses.A_BOLD)
+
+        # Print access points
+        max_ap_size = panel_h - 3
+        ap_lines_printed = 0
+        for key, network in networks.items():
+            network_str = None 
+            for inner_key, inner_item in network.items():
+                if inner_key == 'ssid':
+                    network_str = inner_item.ljust(40-len(inner_key))
+            network_str += f" [{key}]"
+            stdscr.addnstr(2 + ap_lines_printed, 0, network_str.ljust(maxx), maxx)
+            ap_lines_printed += 1
+            if ap_lines_printed >= max_ap_size:
+                break
 
         # Print log header
         total_logs = len(self.logs)
@@ -187,10 +206,16 @@ class NcursesUI:
             elif ch in (ord('q'), ord('Q')):
                 self.running = False
                 break
-            elif ch in (curses.KEY_UP, ord('k')):
+            elif ch == curses.KEY_PPAGE:
                 self.log_offset = max(0, min(self.log_offset + 1, 500))
-            elif ch in (curses.KEY_DOWN, ord('j')):
+            elif ch == curses.KEY_NPAGE:
                 self.log_offset = max(0, min(self.log_offset - 1, 500))
+            elif ch in (curses.KEY_UP, ord('k')):
+                self.ap_offset += 1
+            elif ch in (curses.KEY_DOWN, ord('j')):
+                self.ap_offset -= 1
+            elif ch == ord(' '):
+                self.log_offset = 0
 
 
 def main():
