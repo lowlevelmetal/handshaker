@@ -95,7 +95,7 @@ def get_channel():
 def channel_thread(interface):
     global channel
     global channel_cycle_lock
-    channel = 1
+    channel = 0
 
     while True:
         with channel_cycle_lock:
@@ -181,7 +181,7 @@ class NcursesUI:
 
         # Print log header
         total_logs = len(self.logs)
-        total_log_str = f"Log Offset: {self.log_offset} | Total Log: {total_logs}"
+        total_log_str = f"Current Channel: {get_channel()} | Log Offset: {self.log_offset} | Total Log: {total_logs}"
         total_log_strlen = len(total_log_str)
         log_title_str = "Event Logs".ljust(maxx-total_log_strlen)+total_log_str
         log_pos = panel_h
