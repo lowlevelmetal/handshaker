@@ -88,21 +88,23 @@ def set_channel(chan, interface):
 
 def get_channel():
     global channel
+    global channel_cycle_lock
     with channel_cycle_lock:
         return channel
 
 def channel_thread(interface):
     global channel
+    global channel_cycle_lock
     channel = 1
 
     while True:
         with channel_cycle_lock:
+            channel += 1
             if channel > 11:
                 channel = 1
             if stop_channel_cycle:
                 break
             set_channel(channel, interface)
-            channel += 1
 
         time.sleep(2)
         
