@@ -149,12 +149,15 @@ class NcursesUI:
 
         # Print access points
         max_ap_size = panel_h - 3
+        down_scroll = max(0, self.selected_ap - max_ap_size)
         for i, (bssid, ap) in enumerate(networks.items()):
-            if i >= max_ap_size:
-                break
+            if i - down_scroll > max_ap_size:
+                break;
+            if i < down_scroll:
+                continue
             ssid = ap.get('ssid', '<hidden>').ljust(32)
             line = f"{ssid} [{bssid}]"
-            stdscr.addnstr(2 + i, 0, line.replace('\x00', '').ljust(maxx), maxx, curses.A_REVERSE if i == self.selected_ap else 0)
+            stdscr.addnstr(2 + i - down_scroll, 0, line.replace('\x00', '').ljust(maxx), maxx, curses.A_REVERSE if i == self.selected_ap else 0)
 
         # Print log header
         total_logs = len(self.logs)
