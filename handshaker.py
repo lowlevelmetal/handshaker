@@ -113,7 +113,7 @@ class NcursesUI:
         self.args = args
         self.running = True
         self.log_offset = 0
-        self.ap_offset = 0
+        self.selected_ap = 0
         self.logs = deque(maxlen=250)
         self.log_lock = threading.Lock()
 
@@ -149,17 +149,12 @@ class NcursesUI:
 
         # Print access points
         max_ap_size = panel_h - 3
-        ap_lines_printed = 0
-        for key, network in networks.items():
-            network_str = None 
-            for inner_key, inner_item in network.items():
-                if inner_key == 'ssid':
-                    network_str = inner_item.ljust(40-len(inner_key))
-            network_str += f" [{key}]"
-            stdscr.addnstr(2 + ap_lines_printed, 0, network_str.ljust(maxx), maxx)
-            ap_lines_printed += 1
-            if ap_lines_printed >= max_ap_size:
+        for i, (bssid, ap) in enumerate(networks.items()):
+            if i >= max_ap_size:
                 break
+            ssid = ap.get('ssid', '<hidden>').ljust(32)
+            line = f"{ssid} [{bssid}]"
+            stdscr.addnstr(2 + i, 0, line.replace('\x00', '').ljust(maxx), maxx, curses.A_REVERSE if i == self.selected_ap else 0)
 
         # Print log header
         total_logs = len(self.logs)
@@ -207,13 +202,13 @@ class NcursesUI:
                 self.running = False
                 break
             elif ch == curses.KEY_PPAGE:
-                self.log_offset = max(0, min(self.log_offset + 1, 500))
+                self.log_offset = min(500, self.log_offset + 1)
             elif ch == curses.KEY_NPAGE:
-                self.log_offset = max(0, min(self.log_offset - 1, 500))
+                self.log_offset = max(0, self.log_offset - 1) 
             elif ch in (curses.KEY_UP, ord('k')):
-                self.ap_offset += 1
+                self.selected_ap = max(0, self.selected_ap - 1) 
             elif ch in (curses.KEY_DOWN, ord('j')):
-                self.ap_offset -= 1
+                self.selected_ap = min(self.selected_ap + 1, len(networks) - 1) 
             elif ch == ord(' '):
                 self.log_offset = 0
 
