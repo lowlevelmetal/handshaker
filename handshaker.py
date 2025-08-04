@@ -16,6 +16,7 @@ ui = None
 stop_sniffer = False
 stop_channel_cycle = False
 channel_cycle_lock = threading.Lock()
+channel = 0
 networks = {} 
 
 def is_unicast(mac):
@@ -39,6 +40,16 @@ def packet_handler(pkt):
         if bssid not in networks and ssid is not None:
             networks[bssid] = {'ssid': ssid, 'clients': set()}
             ui.log(f"[+] New AP: {ssid} ({bssid})")
+        if bssid in networks:
+            if 'channels' in networks[bssid]:
+                networks[bssid]['channels'].add(get_channel())
+            else:
+                networks[bssid]['channels'] = {get_channel()}
+        if pkt.haslayer(RadioTap):
+            pwr = pkt[RadioTap].dBm_AntSignal
+            if bssid in networks:
+                networks[bssid]['pwr'] = pwr
+            
 
     # Identify data packets (potential clients)
     if pkt.haslayer(Dot11):
@@ -75,21 +86,26 @@ def set_channel(chan, interface):
     subprocess.run(['iw', 'dev', interface, 'set', 'channel', str(chan)])
     ui.log(f"Channel set to {chan}")
 
+def get_channel():
+    global channel
+    with channel_cycle_lock:
+        return channel
+
 def channel_thread(interface):
-    i = 1
+    global channel
+    channel = 1
 
     while True:
-        if i > 11:
-            i = 1
-
         with channel_cycle_lock:
+            if channel > 11:
+                channel = 1
             if stop_channel_cycle:
                 break
-        
-        set_channel(i, interface)
+            set_channel(channel, interface)
+            channel += 1
 
         time.sleep(2)
-        i = i + 1
+        
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -155,8 +171,10 @@ class NcursesUI:
                 break;
             if i < down_scroll:
                 continue
-            ssid = ap.get('ssid', '<hidden>').ljust(32)
-            line = f"{ssid} [{bssid}]"
+            ssid = ap.get('ssid', '<hidden>').ljust(34)
+            pwr = (str(ap.get('pwr', 'NoSignal')) + "dBm").ljust(12)
+            channels = ",".join(str(chan) for chan in ap['channels']).ljust(12)
+            line = f"{ssid} {pwr} [{bssid}] {channels}"
             stdscr.addnstr(2 + i - down_scroll, 0, line.replace('\x00', '').ljust(maxx), maxx, curses.A_REVERSE if i == self.selected_ap else 0)
 
         # Print log header
@@ -220,6 +238,7 @@ def main():
     global stop_sniffer
     global stop_channel_cycle
     global ui
+    global channel
 
     args = parse_args()
 
@@ -235,8 +254,12 @@ def main():
     tsniffer = threading.Thread(target=sniffer_thread, args=(args,))
     tsniffer.start()
 
-    tchancycle = threading.Thread(target=channel_thread, args=(args.interface,))
-    tchancycle.start()
+    if args.channel is None:
+        tchancycle = threading.Thread(target=channel_thread, args=(args.interface,))
+        tchancycle.start()
+    else:
+        channel = args.channel 
+        set_channel(clamp(channel, 1, 11), args.interface)
 
     try:
         curses.wrapper(ui.run)
